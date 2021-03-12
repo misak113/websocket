@@ -271,7 +271,7 @@ func dial(ctx context.Context, url string, opts *DialOptions) (*Conn, *http.Resp
 
 	opench := make(chan struct{})
 	releaseOpen := ws.OnOpen(func(e js.Value) {
-		close(opench)
+		opench <- struct{}{}
 	})
 	defer releaseOpen()
 
