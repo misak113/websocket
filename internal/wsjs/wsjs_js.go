@@ -162,6 +162,15 @@ func (c WebSocket) SendBytes(v []byte) (err error) {
 	return err
 }
 
+// BufferedAmount returns the number of bytes of data that have been queued
+// using calls to send() but not yet transmitted to the network.
+// This value resets to zero once all queued data has been sent.
+// Use this to implement backpressure detection - if this value grows over time,
+// the client is falling behind and may need throttling or reconnection.
+func (c WebSocket) BufferedAmount() uint64 {
+	return uint64(c.v.Get("bufferedAmount").Int())
+}
+
 func extractArrayBuffer(arrayBuffer js.Value) []byte {
 	uint8Array := js.Global().Get("Uint8Array").New(arrayBuffer)
 	dst := make([]byte, uint8Array.Length())

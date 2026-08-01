@@ -430,6 +430,14 @@ func (c *Conn) SetReadLimit(n int64) {
 	c.msgReadLimit.Store(n)
 }
 
+// BufferedAmount returns the number of bytes of data that have been queued
+// using calls to Write() but not yet transmitted to the network.
+// Monitor this to detect backpressure - a growing value indicates the browser
+// is falling behind and may need throttling or reconnection.
+func (c *Conn) BufferedAmount() uint64 {
+	return c.ws.BufferedAmount()
+}
+
 func (c *Conn) setCloseErr(err error) {
 	c.closeErrOnce.Do(func() {
 		c.closeErr = fmt.Errorf("WebSocket closed: %w", err)
