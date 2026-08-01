@@ -139,6 +139,13 @@ func (c WebSocket) Close(code int, reason string) (err error) {
 	return err
 }
 
+// CloseNow closes the WebSocket without a status code or reason.
+func (c WebSocket) CloseNow() (err error) {
+	defer handleJSError(&err, nil)
+	c.v.Call("close")
+	return err
+}
+
 // SendText sends the given string as a text message
 // on the WebSocket.
 func (c WebSocket) SendText(v string) (err error) {
