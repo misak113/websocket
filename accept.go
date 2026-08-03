@@ -1,9 +1,10 @@
-// +build !js
+//go:build !js
 
 package websocket
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
@@ -13,10 +14,10 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
-	"path/filepath"
+	"path"
 	"strings"
 
-	"nhooyr.io/websocket/internal/errd"
+	"github.com/coder/websocket/internal/errd"
 )
 
 // AcceptOptions represents Accept's options.
@@ -39,9 +40,10 @@ type AcceptOptions struct {
 	// In such a case, example.com is the origin and chat.example.com is the request host.
 	// One would set this field to []string{"example.com"} to authorize example.com to connect.
 	//
-	// Each pattern is matched case insensitively against the request origin host
-	// with filepath.Match.
-	// See https://golang.org/pkg/path/filepath/#Match
+	// Each pattern is matched case insensitively with path.Match (see
+	// https://golang.org/pkg/path/#Match). By default, it is matched
+	// against the request origin host. If the pattern contains a URI
+	// scheme ("://"), it will be matched against "scheme://host".
 	//
 	// Please ensure you understand the ramifications of enabling this.
 	// If used incorrectly your WebSocket server will be open to CSRF attacks.
@@ -51,7 +53,7 @@ type AcceptOptions struct {
 	OriginPatterns []string
 
 	// CompressionMode controls the compression mode.
-	// Defaults to CompressionNoContextTakeover.
+	// Defaults to CompressionDisabled.
 	//
 	// See docs on CompressionMode for details.
 	CompressionMode CompressionMode
@@ -61,15 +63,42 @@ type AcceptOptions struct {
 	// Defaults to 512 bytes for CompressionNoContextTakeover and 128 bytes
 	// for CompressionContextTakeover.
 	CompressionThreshold int
+
+	// OnPingReceived is an optional callback invoked synchronously when a ping frame is received.
+	//
+	// The payload contains the application data of the ping frame.
+	// If the callback returns false, the subsequent pong frame will not be sent.
+	// To avoid blocking, any expensive processing should be performed asynchronously using a goroutine.
+	OnPingReceived func(ctx context.Context, payload []byte) bool
+
+	// OnPongReceived is an optional callback invoked synchronously when a pong frame is received.
+	//
+	// The payload contains the application data of the pong frame.
+	// To avoid blocking, any expensive processing should be performed asynchronously using a goroutine.
+	//
+	// Unlike OnPingReceived, this callback does not return a value because a pong frame
+	// is a response to a ping and does not trigger any further frame transmission.
+	OnPongReceived func(ctx context.Context, payload []byte)
+}
+
+func (opts *AcceptOptions) cloneWithDefaults() *AcceptOptions {
+	var o AcceptOptions
+	if opts != nil {
+		o = *opts
+	}
+	return &o
 }
 
 // Accept accepts a WebSocket handshake from a client and upgrades the
-// the connection to a WebSocket.
+// connection to a WebSocket.
 //
 // Accept will not allow cross origin requests by default.
 // See the InsecureSkipVerify and OriginPatterns options to allow cross origin requests.
 //
 // Accept will write a response to w on all errors.
+//
+// Note that using the http.Request Context after Accept returns may lead to
+// unexpected behavior (see http.Hijacker).
 func Accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (*Conn, error) {
 	return accept(w, r, opts)
 }
@@ -77,21 +106,17 @@ func Accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (*Conn,
 func accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (_ *Conn, err error) {
 	defer errd.Wrap(&err, "failed to accept WebSocket connection")
 
-	if opts == nil {
-		opts = &AcceptOptions{}
-	}
-	opts = &*opts
-
 	errCode, err := verifyClientRequest(w, r)
 	if err != nil {
 		http.Error(w, err.Error(), errCode)
 		return nil, err
 	}
 
+	opts = opts.cloneWithDefaults()
 	if !opts.InsecureSkipVerify {
 		err = authenticateOrigin(r, opts.OriginPatterns)
 		if err != nil {
-			if errors.Is(err, filepath.ErrBadPattern) {
+			if errors.Is(err, path.ErrBadPattern) {
 				log.Printf("websocket: %v", err)
 				err = errors.New(http.StatusText(http.StatusForbidden))
 			}
@@ -100,7 +125,7 @@ func accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (_ *Con
 		}
 	}
 
-	hj, ok := w.(http.Hijacker)
+	hj, ok := hijacker(w)
 	if !ok {
 		err = errors.New("http.ResponseWriter does not implement http.Hijacker")
 		http.Error(w, http.StatusText(http.StatusNotImplemented), http.StatusNotImplemented)
@@ -118,9 +143,9 @@ func accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (_ *Con
 		w.Header().Set("Sec-WebSocket-Protocol", subproto)
 	}
 
-	copts, err := acceptCompression(r, w, opts.CompressionMode)
-	if err != nil {
-		return nil, err
+	copts, ok := selectDeflate(websocketExtensions(r.Header), opts.CompressionMode)
+	if ok {
+		w.Header().Set("Sec-WebSocket-Extensions", copts.String())
 	}
 
 	w.WriteHeader(http.StatusSwitchingProtocols)
@@ -148,6 +173,8 @@ func accept(w http.ResponseWriter, r *http.Request, opts *AcceptOptions) (_ *Con
 		client:         false,
 		copts:          copts,
 		flateThreshold: opts.CompressionThreshold,
+		onPingReceived: opts.OnPingReceived,
+		onPongReceived: opts.OnPongReceived,
 
 		br: brw.Reader,
 		bw: brw.Writer,
@@ -180,8 +207,19 @@ func verifyClientRequest(w http.ResponseWriter, r *http.Request) (errCode int, _
 		return http.StatusBadRequest, fmt.Errorf("unsupported WebSocket protocol version (only 13 is supported): %q", r.Header.Get("Sec-WebSocket-Version"))
 	}
 
-	if r.Header.Get("Sec-WebSocket-Key") == "" {
+	websocketSecKeys := r.Header.Values("Sec-WebSocket-Key")
+	if len(websocketSecKeys) == 0 {
 		return http.StatusBadRequest, errors.New("WebSocket protocol violation: missing Sec-WebSocket-Key")
+	}
+
+	if len(websocketSecKeys) > 1 {
+		return http.StatusBadRequest, errors.New("WebSocket protocol violation: multiple Sec-WebSocket-Key headers")
+	}
+
+	// The RFC states to remove any leading or trailing whitespace.
+	websocketSecKey := strings.TrimSpace(websocketSecKeys[0])
+	if v, err := base64.StdEncoding.DecodeString(websocketSecKey); err != nil || len(v) != 16 {
+		return http.StatusBadRequest, fmt.Errorf("WebSocket protocol violation: invalid Sec-WebSocket-Key %q, must be a 16 byte base64 encoded string", websocketSecKey)
 	}
 
 	return 0, nil
@@ -203,19 +241,26 @@ func authenticateOrigin(r *http.Request, originHosts []string) error {
 	}
 
 	for _, hostPattern := range originHosts {
-		matched, err := match(hostPattern, u.Host)
+		target := u.Host
+		if strings.Contains(hostPattern, "://") {
+			target = u.Scheme + "://" + u.Host
+		}
+		matched, err := match(hostPattern, target)
 		if err != nil {
-			return fmt.Errorf("failed to parse filepath pattern %q: %w", hostPattern, err)
+			return fmt.Errorf("failed to parse path pattern %q: %w", hostPattern, err)
 		}
 		if matched {
 			return nil
 		}
 	}
-	return fmt.Errorf("request Origin %q is not authorized for Host %q", origin, r.Host)
+	if u.Host == "" {
+		return fmt.Errorf("request Origin %q is not a valid URL with a host", origin)
+	}
+	return fmt.Errorf("request Origin %q is not authorized for Host %q", u.Host, r.Host)
 }
 
 func match(pattern, s string) (bool, error) {
-	return filepath.Match(strings.ToLower(pattern), strings.ToLower(s))
+	return path.Match(strings.ToLower(pattern), strings.ToLower(s))
 }
 
 func selectSubprotocol(r *http.Request, subprotocols []string) string {
@@ -230,26 +275,26 @@ func selectSubprotocol(r *http.Request, subprotocols []string) string {
 	return ""
 }
 
-func acceptCompression(r *http.Request, w http.ResponseWriter, mode CompressionMode) (*compressionOptions, error) {
+func selectDeflate(extensions []websocketExtension, mode CompressionMode) (*compressionOptions, bool) {
 	if mode == CompressionDisabled {
-		return nil, nil
+		return nil, false
 	}
-
-	for _, ext := range websocketExtensions(r.Header) {
+	for _, ext := range extensions {
 		switch ext.name {
+		// We used to implement x-webkit-deflate-frame too for Safari but Safari has bugs...
+		// See https://github.com/nhooyr/websocket/issues/218
 		case "permessage-deflate":
-			return acceptDeflate(w, ext, mode)
-			// Disabled for now, see https://github.com/nhooyr/websocket/issues/218
-			// case "x-webkit-deflate-frame":
-			// 	return acceptWebkitDeflate(w, ext, mode)
+			copts, ok := acceptDeflate(ext, mode)
+			if ok {
+				return copts, true
+			}
 		}
 	}
-	return nil, nil
+	return nil, false
 }
 
-func acceptDeflate(w http.ResponseWriter, ext websocketExtension, mode CompressionMode) (*compressionOptions, error) {
+func acceptDeflate(ext websocketExtension, mode CompressionMode) (*compressionOptions, bool) {
 	copts := mode.opts()
-
 	for _, p := range ext.params {
 		switch p {
 		case "client_no_context_takeover":
@@ -258,55 +303,18 @@ func acceptDeflate(w http.ResponseWriter, ext websocketExtension, mode Compressi
 		case "server_no_context_takeover":
 			copts.serverNoContextTakeover = true
 			continue
-		}
-
-		if strings.HasPrefix(p, "client_max_window_bits") {
-			// We cannot adjust the read sliding window so cannot make use of this.
+		case "client_max_window_bits",
+			"server_max_window_bits=15":
 			continue
 		}
 
-		err := fmt.Errorf("unsupported permessage-deflate parameter: %q", p)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return nil, err
-	}
-
-	copts.setHeader(w.Header())
-
-	return copts, nil
-}
-
-func acceptWebkitDeflate(w http.ResponseWriter, ext websocketExtension, mode CompressionMode) (*compressionOptions, error) {
-	copts := mode.opts()
-	// The peer must explicitly request it.
-	copts.serverNoContextTakeover = false
-
-	for _, p := range ext.params {
-		if p == "no_context_takeover" {
-			copts.serverNoContextTakeover = true
+		if strings.HasPrefix(p, "client_max_window_bits=") {
+			// We can't adjust the deflate window, but decoding with a larger window is acceptable.
 			continue
 		}
-
-		// We explicitly fail on x-webkit-deflate-frame's max_window_bits parameter instead
-		// of ignoring it as the draft spec is unclear. It says the server can ignore it
-		// but the server has no way of signalling to the client it was ignored as the parameters
-		// are set one way.
-		// Thus us ignoring it would make the client think we understood it which would cause issues.
-		// See https://tools.ietf.org/html/draft-tyoshino-hybi-websocket-perframe-deflate-06#section-4.1
-		//
-		// Either way, we're only implementing this for webkit which never sends the max_window_bits
-		// parameter so we don't need to worry about it.
-		err := fmt.Errorf("unsupported x-webkit-deflate-frame parameter: %q", p)
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return nil, err
+		return nil, false
 	}
-
-	s := "x-webkit-deflate-frame"
-	if copts.clientNoContextTakeover {
-		s += "; no_context_takeover"
-	}
-	w.Header().Set("Sec-WebSocket-Extensions", s)
-
-	return copts, nil
+	return copts, true
 }
 
 func headerContainsTokenIgnoreCase(h http.Header, key, token string) bool {

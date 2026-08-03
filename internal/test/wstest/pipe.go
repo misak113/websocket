@@ -1,4 +1,4 @@
-// +build !js
+//go:build !js
 
 package wstest
 
@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // Pipe is used to create an in memory connection
@@ -24,7 +24,8 @@ func Pipe(dialOpts *websocket.DialOptions, acceptOpts *websocket.AcceptOptions) 
 	if dialOpts == nil {
 		dialOpts = &websocket.DialOptions{}
 	}
-	dialOpts = &*dialOpts
+	_dialOpts := *dialOpts
+	dialOpts = &_dialOpts
 	dialOpts.HTTPClient = &http.Client{
 		Transport: tt,
 	}

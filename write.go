@@ -1,20 +1,22 @@
-// +build !js
+//go:build !js
 
 package websocket
 
 import (
 	"bufio"
+	"compress/flate"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"time"
 
-	"github.com/klauspost/compress/flate"
-
-	"nhooyr.io/websocket/internal/errd"
+	"github.com/coder/websocket/internal/bpool"
+	"github.com/coder/websocket/internal/errd"
+	"github.com/coder/websocket/internal/util"
 )
 
 // Writer returns a writer bounded by the context that will write
@@ -36,7 +38,7 @@ func (c *Conn) Writer(ctx context.Context, typ MessageType) (io.WriteCloser, err
 //
 // See the Writer method if you want to stream a message.
 //
-// If compression is disabled or the threshold is not met, then it
+// If compression is disabled or the compression threshold is not met, then it
 // will write the message in a single frame.
 func (c *Conn) Write(ctx context.Context, typ MessageType, p []byte) error {
 	_, err := c.write(ctx, typ, p)
@@ -47,41 +49,22 @@ func (c *Conn) Write(ctx context.Context, typ MessageType, p []byte) error {
 }
 
 type msgWriter struct {
-	mw     *msgWriterState
-	closed bool
-}
-
-func (mw *msgWriter) Write(p []byte) (int, error) {
-	if mw.closed {
-		return 0, errors.New("cannot use closed writer")
-	}
-	return mw.mw.Write(p)
-}
-
-func (mw *msgWriter) Close() error {
-	if mw.closed {
-		return errors.New("cannot use closed writer")
-	}
-	mw.closed = true
-	return mw.mw.Close()
-}
-
-type msgWriterState struct {
 	c *Conn
 
 	mu      *mu
 	writeMu *mu
+	closed  bool
 
 	ctx    context.Context
 	opcode opcode
 	flate  bool
 
-	trimWriter *trimLastFourBytesWriter
-	dict       slidingWindow
+	trimWriter  *trimLastFourBytesWriter
+	flateWriter *flate.Writer
 }
 
-func newMsgWriterState(c *Conn) *msgWriterState {
-	mw := &msgWriterState{
+func newMsgWriter(c *Conn) *msgWriter {
+	mw := &msgWriter{
 		c:       c,
 		mu:      newMu(c),
 		writeMu: newMu(c),
@@ -89,18 +72,20 @@ func newMsgWriterState(c *Conn) *msgWriterState {
 	return mw
 }
 
-func (mw *msgWriterState) ensureFlate() {
+func (mw *msgWriter) ensureFlate() {
 	if mw.trimWriter == nil {
 		mw.trimWriter = &trimLastFourBytesWriter{
-			w: writerFunc(mw.write),
+			w: util.WriterFunc(mw.write),
 		}
 	}
 
-	mw.dict.init(8192)
+	if mw.flateWriter == nil {
+		mw.flateWriter = getFlateWriter(mw.trimWriter)
+	}
 	mw.flate = true
 }
 
-func (mw *msgWriterState) flateContextTakeover() bool {
+func (mw *msgWriter) flateContextTakeover() bool {
 	if mw.c.client {
 		return !mw.c.copts.clientNoContextTakeover
 	}
@@ -108,37 +93,28 @@ func (mw *msgWriterState) flateContextTakeover() bool {
 }
 
 func (c *Conn) writer(ctx context.Context, typ MessageType) (io.WriteCloser, error) {
-	err := c.msgWriterState.reset(ctx, typ)
+	err := c.msgWriter.reset(ctx, typ)
 	if err != nil {
 		return nil, err
 	}
-	return &msgWriter{
-		mw:     c.msgWriterState,
-		closed: false,
-	}, nil
+	return c.msgWriter, nil
 }
 
 func (c *Conn) write(ctx context.Context, typ MessageType, p []byte) (int, error) {
-	mw, err := c.writer(ctx, typ)
+	err := c.msgWriter.reset(ctx, typ)
 	if err != nil {
 		return 0, err
 	}
+	defer c.msgWriter.mu.unlock()
 
-	if !c.flate() {
-		defer c.msgWriterState.mu.unlock()
-		return c.writeFrame(ctx, true, false, c.msgWriterState.opcode, p)
+	if !c.flate() || len(p) < c.flateThreshold {
+		return c.writeFrame(ctx, true, false, c.msgWriter.opcode, p)
 	}
 
-	n, err := mw.Write(p)
-	if err != nil {
-		return n, err
-	}
-
-	err = mw.Close()
-	return n, err
+	return c.msgWriter.writeCompressedFrame(ctx, p)
 }
 
-func (mw *msgWriterState) reset(ctx context.Context, typ MessageType) error {
+func (mw *msgWriter) reset(ctx context.Context, typ MessageType) error {
 	err := mw.mu.lock(ctx)
 	if err != nil {
 		return err
@@ -147,24 +123,85 @@ func (mw *msgWriterState) reset(ctx context.Context, typ MessageType) error {
 	mw.ctx = ctx
 	mw.opcode = opcode(typ)
 	mw.flate = false
+	mw.closed = false
 
 	mw.trimWriter.reset()
 
 	return nil
 }
 
+func (mw *msgWriter) putFlateWriter() {
+	if mw.flateWriter != nil {
+		putFlateWriter(mw.flateWriter)
+		mw.flateWriter = nil
+	}
+}
+
+// writeCompressedFrame compresses and writes p as a single frame.
+func (mw *msgWriter) writeCompressedFrame(ctx context.Context, p []byte) (int, error) {
+	err := mw.writeMu.lock(mw.ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to write: %w", err)
+	}
+	defer mw.writeMu.unlock()
+
+	if mw.closed {
+		return 0, errors.New("cannot use closed writer")
+	}
+
+	mw.ensureFlate()
+
+	buf := bpool.Get()
+	defer bpool.Put(buf)
+
+	// Buffer compressed output so we can write as
+	// a single frame instead of chunked frames.
+	origWriter := mw.trimWriter.w
+	mw.trimWriter.w = buf
+	defer func() {
+		mw.trimWriter.w = origWriter
+	}()
+
+	_, err = mw.flateWriter.Write(p)
+	if err != nil {
+		return 0, fmt.Errorf("failed to compress: %w", err)
+	}
+
+	err = mw.flateWriter.Flush()
+	if err != nil {
+		return 0, fmt.Errorf("failed to flush compression: %w", err)
+	}
+
+	mw.trimWriter.reset()
+
+	if !mw.flateContextTakeover() {
+		mw.putFlateWriter()
+	}
+
+	mw.closed = true
+
+	_, err = mw.c.writeFrame(ctx, true, true, mw.opcode, buf.Bytes())
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
 // Write writes the given bytes to the WebSocket connection.
-func (mw *msgWriterState) Write(p []byte) (_ int, err error) {
+func (mw *msgWriter) Write(p []byte) (_ int, err error) {
 	err = mw.writeMu.lock(mw.ctx)
 	if err != nil {
 		return 0, fmt.Errorf("failed to write: %w", err)
 	}
 	defer mw.writeMu.unlock()
 
+	if mw.closed {
+		return 0, errors.New("cannot use closed writer")
+	}
+
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("failed to write: %w", err)
-			mw.c.close(err)
 		}
 	}()
 
@@ -177,18 +214,13 @@ func (mw *msgWriterState) Write(p []byte) (_ int, err error) {
 	}
 
 	if mw.flate {
-		err = flate.StatelessDeflate(mw.trimWriter, p, false, mw.dict.buf)
-		if err != nil {
-			return 0, err
-		}
-		mw.dict.write(p)
-		return len(p), nil
+		return mw.flateWriter.Write(p)
 	}
 
 	return mw.write(p)
 }
 
-func (mw *msgWriterState) write(p []byte) (int, error) {
+func (mw *msgWriter) write(p []byte) (int, error) {
 	n, err := mw.c.writeFrame(mw.ctx, false, mw.flate, mw.opcode, p)
 	if err != nil {
 		return n, fmt.Errorf("failed to write data frame: %w", err)
@@ -198,7 +230,7 @@ func (mw *msgWriterState) write(p []byte) (int, error) {
 }
 
 // Close flushes the frame to the connection.
-func (mw *msgWriterState) Close() (err error) {
+func (mw *msgWriter) Close() (err error) {
 	defer errd.Wrap(&err, "failed to close writer")
 
 	err = mw.writeMu.lock(mw.ctx)
@@ -207,26 +239,38 @@ func (mw *msgWriterState) Close() (err error) {
 	}
 	defer mw.writeMu.unlock()
 
+	if mw.closed {
+		return errors.New("writer already closed")
+	}
+	mw.closed = true
+
+	if mw.flate {
+		err = mw.flateWriter.Flush()
+		if err != nil {
+			return fmt.Errorf("failed to flush flate: %w", err)
+		}
+	}
+
 	_, err = mw.c.writeFrame(mw.ctx, true, mw.flate, mw.opcode, nil)
 	if err != nil {
 		return fmt.Errorf("failed to write fin frame: %w", err)
 	}
 
 	if mw.flate && !mw.flateContextTakeover() {
-		mw.dict.close()
+		mw.putFlateWriter()
 	}
 	mw.mu.unlock()
 	return nil
 }
 
-func (mw *msgWriterState) close() {
+func (mw *msgWriter) close() {
 	if mw.c.client {
 		mw.c.writeFrameMu.forceLock()
 		putBufioWriter(mw.c.bw)
 	}
 
 	mw.writeMu.forceLock()
-	mw.dict.close()
+	mw.putFlateWriter()
 }
 
 func (c *Conn) writeControl(ctx context.Context, opcode opcode, p []byte) error {
@@ -240,7 +284,7 @@ func (c *Conn) writeControl(ctx context.Context, opcode opcode, p []byte) error 
 	return nil
 }
 
-// frame handles all writes to the connection.
+// writeFrame handles all writes to the connection.
 func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opcode, p []byte) (_ int, err error) {
 	err = c.writeFrameMu.lock(ctx)
 	if err != nil {
@@ -248,41 +292,35 @@ func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opco
 	}
 	defer c.writeFrameMu.unlock()
 
-	// If the state says a close has already been written, we wait until
-	// the connection is closed and return that error.
-	//
-	// However, if the frame being written is a close, that means its the close from
-	// the state being set so we let it go through.
-	c.closeMu.Lock()
-	wroteClose := c.wroteClose
-	c.closeMu.Unlock()
-	if wroteClose && opcode != opClose {
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-c.closed:
-			return 0, c.closeErr
+	defer func() {
+		if c.isClosed() && opcode == opClose {
+			err = nil
 		}
+		if err != nil {
+			if ctx.Err() != nil {
+				err = ctx.Err()
+			} else if c.isClosed() {
+				err = net.ErrClosed
+			}
+			err = fmt.Errorf("failed to write frame: %w", err)
+		}
+	}()
+
+	c.closeStateMu.Lock()
+	closeSentErr := c.closeSentErr
+	c.closeStateMu.Unlock()
+	if closeSentErr != nil {
+		return 0, net.ErrClosed
 	}
 
 	select {
 	case <-c.closed:
-		return 0, c.closeErr
-	case c.writeTimeout <- ctx:
+		return 0, net.ErrClosed
+	default:
 	}
-
-	defer func() {
-		if err != nil {
-			select {
-			case <-c.closed:
-				err = c.closeErr
-			case <-ctx.Done():
-				err = ctx.Err()
-			}
-			c.close(err)
-			err = fmt.Errorf("failed to write frame: %w", err)
-		}
-	}()
+	if c.setupWriteTimeout(ctx) {
+		defer c.clearWriteTimeout()
+	}
 
 	c.writeHeader.fin = fin
 	c.writeHeader.opcode = opcode
@@ -319,10 +357,16 @@ func (c *Conn) writeFrame(ctx context.Context, fin bool, flate bool, opcode opco
 		}
 	}
 
-	select {
-	case <-c.closed:
-		return n, c.closeErr
-	case c.writeTimeout <- context.Background():
+	if opcode == opClose {
+		c.closeStateMu.Lock()
+		c.closeSentErr = fmt.Errorf("sent close frame: %w", net.ErrClosed)
+		closeReceived := c.closeReceivedErr != nil
+		c.closeStateMu.Unlock()
+
+		if closeReceived && !c.casClosing() {
+			c.writeFrameMu.unlock()
+			_ = c.close()
+		}
 	}
 
 	return n, nil
@@ -348,17 +392,14 @@ func (c *Conn) writeFramePayload(p []byte) (n int, err error) {
 		// Start of next write in the buffer.
 		i := c.bw.Buffered()
 
-		j := len(p)
-		if j > c.bw.Available() {
-			j = c.bw.Available()
-		}
+		j := min(len(p), c.bw.Available())
 
 		_, err := c.bw.Write(p[:j])
 		if err != nil {
 			return n, err
 		}
 
-		maskKey = mask(maskKey, c.writeBuf[i:c.bw.Buffered()])
+		maskKey = mask(c.writeBuf[i:c.bw.Buffered()], maskKey)
 
 		p = p[j:]
 		n += j
@@ -367,17 +408,11 @@ func (c *Conn) writeFramePayload(p []byte) (n int, err error) {
 	return n, nil
 }
 
-type writerFunc func(p []byte) (int, error)
-
-func (f writerFunc) Write(p []byte) (int, error) {
-	return f(p)
-}
-
 // extractBufioWriterBuf grabs the []byte backing a *bufio.Writer
 // and returns it.
 func extractBufioWriterBuf(bw *bufio.Writer, w io.Writer) []byte {
 	var writeBuf []byte
-	bw.Reset(writerFunc(func(p2 []byte) (int, error) {
+	bw.Reset(util.WriterFunc(func(p2 []byte) (int, error) {
 		writeBuf = p2[:cap(p2)]
 		return len(p2), nil
 	}))
@@ -391,7 +426,5 @@ func extractBufioWriterBuf(bw *bufio.Writer, w io.Writer) []byte {
 }
 
 func (c *Conn) writeError(code StatusCode, err error) {
-	c.setCloseErr(err)
 	c.writeClose(code, err.Error())
-	c.close(nil)
 }

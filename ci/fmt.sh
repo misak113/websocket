@@ -1,38 +1,25 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
+cd -- "$(dirname "$0")/.."
 
-main() {
-  cd "$(dirname "$0")/.."
+X_TOOLS_VERSION=v0.31.0
 
-  go mod tidy
-  gofmt -w -s .
-  goimports -w "-local=$(go list -m)" .
+go mod tidy
+(cd ./internal/thirdparty && go mod tidy)
+(cd ./internal/examples && go mod tidy)
+gofmt -w -s .
+go run golang.org/x/tools/cmd/goimports@${X_TOOLS_VERSION} -w "-local=$(go list -m)" .
 
-  prettier \
-    --write \
-    --print-width=120 \
-    --no-semi \
-    --trailing-comma=all \
-    --loglevel=warn \
-    --arrow-parens=avoid \
-    $(git ls-files "*.yml" "*.md" "*.js" "*.css" "*.html")
-  shfmt -i 2 -w -s -sr $(git ls-files "*.sh")
+git ls-files "*.yml" "*.md" "*.js" "*.css" "*.html" | xargs npx prettier@3.3.3 \
+  --check \
+  --log-level=warn \
+  --print-width=90 \
+  --no-semi \
+  --single-quote \
+  --arrow-parens=avoid
 
-  stringer -type=opcode,MessageType,StatusCode -output=stringer.go
+go run golang.org/x/tools/cmd/stringer@${X_TOOLS_VERSION} -type=opcode,MessageType,StatusCode -output=stringer.go
 
-  if [[ ${CI-} ]]; then
-    ensure_fmt
-  fi
-}
-
-ensure_fmt() {
-  if [[ $(git ls-files --other --modified --exclude-standard) ]]; then
-    git -c color.ui=always --no-pager diff
-    echo
-    echo "Please run the following locally:"
-    echo "  ./ci/fmt.sh"
-    exit 1
-  fi
-}
-
-main "$@"
+if [ "${CI-}" ]; then
+  git diff --exit-code
+fi
